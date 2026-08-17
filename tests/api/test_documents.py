@@ -6,10 +6,14 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from docintel.api.routes.documents import get_embedding_provider
 from docintel.app import app
-from docintel.db.models import DocumentPage
+from docintel.db.models import Document, DocumentChunk, DocumentPage
 from docintel.documents.extraction import MAX_FILE_BYTES
+from docintel.providers.embeddings import EmbeddingProviderFailure, OpenAIEmbeddingProvider
+from tests.fakes import FakeEmbeddingProvider
 from tests.fixtures.pdfs import make_text_pdf
+from tests.fixtures.tokens import text_with_token_count
 
 pytestmark = [pytest.mark.database, pytest.mark.anyio]
 
@@ -20,11 +24,26 @@ def anyio_backend() -> str:
 
 
 @pytest.fixture
-async def client(database_session: Session) -> AsyncIterator[httpx.AsyncClient]:
+def fake_embedding_provider() -> FakeEmbeddingProvider:
+    return FakeEmbeddingProvider()
+
+
+@pytest.fixture
+async def client(
+    database_session: Session,
+    fake_embedding_provider: FakeEmbeddingProvider,
+) -> AsyncIterator[httpx.AsyncClient]:
     del database_session
+    app.dependency_overrides[get_embedding_provider] = lambda: fake_embedding_provider
     transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as test_client:
-        yield test_client
+    try:
+        async with httpx.AsyncClient(
+            transport=transport,
+            base_url="http://testserver",
+        ) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.clear()
 
 
 async def test_healthz_is_independent_of_external_services(client: httpx.AsyncClient) -> None:
@@ -39,7 +58,10 @@ async def test_readyz_with_healthy_database(client: httpx.AsyncClient) -> None:
     assert response.json() == {"status": "ready"}
 
 
-async def test_valid_upload_persists_page_metadata(client: httpx.AsyncClient) -> None:
+async def test_valid_upload_persists_page_metadata(
+    client: httpx.AsyncClient,
+    database_session: Session,
+) -> None:
     response = await client.post(
         "/api/v1/documents",
         files={"file": ("lesson.pdf", make_text_pdf(["One", None, "Three"]), "application/pdf")},
@@ -49,13 +71,18 @@ async def test_valid_upload_persists_page_metadata(client: httpx.AsyncClient) ->
     assert body["filename"] == "lesson.pdf"
     assert body["page_count"] == 3
     assert body["extracted_char_count"] == 8
-    assert body["status"] == "INGESTED"
-    assert body["embedding_model"] is None
-    assert body["embedding_dimensions"] is None
-    assert body["indexed_at"] is None
+    assert body["status"] == "INDEXED"
+    assert body["embedding_model"] == "text-embedding-3-small"
+    assert body["embedding_dimensions"] == 1536
+    assert body["indexed_at"] is not None
+    database_session.expire_all()
+    assert database_session.scalar(select(func.count(DocumentChunk.id))) == 2
 
 
-async def test_duplicate_upload_returns_existing_document_id(client: httpx.AsyncClient) -> None:
+async def test_duplicate_upload_returns_existing_document_id(
+    client: httpx.AsyncClient,
+    fake_embedding_provider: FakeEmbeddingProvider,
+) -> None:
     pdf = make_text_pdf(["Duplicate"])
     first = await client.post(
         "/api/v1/documents",
@@ -72,6 +99,7 @@ async def test_duplicate_upload_returns_existing_document_id(client: httpx.Async
         "message": "A document with the same content already exists.",
         "document_id": first.json()["id"],
     }
+    assert len(fake_embedding_provider.calls) == 1
 
 
 async def test_large_upload_returns_413(client: httpx.AsyncClient) -> None:
@@ -118,6 +146,58 @@ async def test_pdf_without_text_returns_422(client: httpx.AsyncClient) -> None:
     assert response.json()["code"] == "document_text_not_extractable"
 
 
+async def test_chunk_limit_returns_422_before_provider(
+    client: httpx.AsyncClient,
+    fake_embedding_provider: FakeEmbeddingProvider,
+) -> None:
+    response = await client.post(
+        "/api/v1/documents",
+        files={
+            "file": (
+                "too-many-chunks.pdf",
+                make_text_pdf([text_with_token_count(125_101)]),
+                "application/pdf",
+            )
+        },
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == "document_limits_exceeded"
+    assert fake_embedding_provider.calls == []
+
+
+async def test_provider_failure_is_sanitized_and_atomic(
+    client: httpx.AsyncClient,
+    database_session: Session,
+    fake_embedding_provider: FakeEmbeddingProvider,
+) -> None:
+    fake_embedding_provider.failure = EmbeddingProviderFailure("sensitive provider detail")
+    response = await client.post(
+        "/api/v1/documents",
+        files={"file": ("failure.pdf", make_text_pdf(["Text"]), "application/pdf")},
+    )
+    assert response.status_code == 502
+    assert response.json() == {
+        "code": "embedding_provider_error",
+        "message": "The embedding provider could not index the document.",
+    }
+    database_session.expire_all()
+    assert database_session.scalar(select(func.count(Document.id))) == 0
+    assert database_session.scalar(select(func.count(DocumentPage.document_id))) == 0
+    assert database_session.scalar(select(func.count(DocumentChunk.id))) == 0
+
+
+async def test_real_provider_without_api_key_returns_503_only_on_upload(
+    client: httpx.AsyncClient,
+) -> None:
+    app.dependency_overrides[get_embedding_provider] = lambda: OpenAIEmbeddingProvider(api_key=None)
+    response = await client.post(
+        "/api/v1/documents",
+        files={"file": ("unconfigured.pdf", make_text_pdf(["Text"]), "application/pdf")},
+    )
+    assert response.status_code == 503
+    assert response.json()["code"] == "embedding_provider_unconfigured"
+
+
 async def test_get_documents_returns_metadata_only(client: httpx.AsyncClient) -> None:
     upload = await client.post(
         "/api/v1/documents",
@@ -128,6 +208,7 @@ async def test_get_documents_returns_metadata_only(client: httpx.AsyncClient) ->
     assert len(response.json()) == 1
     item = response.json()[0]
     assert item["id"] == upload.json()["id"]
+    assert item["status"] == "INDEXED"
     assert "content" not in item
     assert "pages" not in item
 
@@ -145,6 +226,7 @@ async def test_delete_document_cascades_pages(
     assert response.status_code == 204
     database_session.expire_all()
     assert database_session.scalar(select(func.count(DocumentPage.document_id))) == 0
+    assert database_session.scalar(select(func.count(DocumentChunk.id))) == 0
 
 
 async def test_delete_missing_document_returns_404(client: httpx.AsyncClient) -> None:

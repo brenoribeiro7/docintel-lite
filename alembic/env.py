@@ -1,10 +1,11 @@
 from logging.config import fileConfig
 
 from sqlalchemy import engine_from_config, pool
+from sqlalchemy.dialects.postgresql.base import ischema_names
 
 from alembic import context
 from docintel.config import get_settings
-from docintel.db.models import Base
+from docintel.db.models import Base, Vector1536
 
 config = context.config
 if config.config_file_name is not None:
@@ -12,6 +13,7 @@ if config.config_file_name is not None:
 
 config.set_main_option("sqlalchemy.url", get_settings().database_url)
 target_metadata = Base.metadata
+ischema_names["vector"] = Vector1536
 
 
 def run_migrations_offline() -> None:

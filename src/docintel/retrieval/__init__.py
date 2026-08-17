@@ -1,0 +1,1 @@
+"""Internal exact vector retrieval."""

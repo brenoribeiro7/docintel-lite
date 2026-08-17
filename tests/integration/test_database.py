@@ -44,7 +44,9 @@ def make_document(*, content_hash: str | None = None) -> Document:
 def test_initial_migration_schema_and_vector_extension(database_session: Session) -> None:
     bind = database_session.get_bind()
     inspector = inspect(bind)
-    assert {"alembic_version", "documents", "document_pages"} <= set(inspector.get_table_names())
+    assert {"alembic_version", "documents", "document_pages", "document_chunks"} <= set(
+        inspector.get_table_names()
+    )
     assert database_session.scalar(text("SELECT version()")) is not None
     assert database_session.scalar(text("SHOW server_version_num")) == "180006"
     assert (
@@ -54,12 +56,11 @@ def test_initial_migration_schema_and_vector_extension(database_session: Session
         == "0.8.6"
     )
     assert database_session.scalar(text("SELECT version_num FROM alembic_version")) == (
-        "0001_document_ingestion"
+        "0002_document_chunks"
     )
 
     columns = {column["name"] for column in inspector.get_columns("documents")}
     assert "binary_content" not in columns
-    assert "document_chunks" not in inspector.get_table_names()
     primary_key = inspector.get_pk_constraint("document_pages")
     assert primary_key["constrained_columns"] == ["document_id", "page_number"]
     foreign_key = inspector.get_foreign_keys("document_pages")[0]

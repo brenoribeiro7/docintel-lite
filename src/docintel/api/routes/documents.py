@@ -6,6 +6,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from docintel.api.schemas import DocumentResponse, DuplicateDocumentResponse, ErrorResponse
+from docintel.config import get_settings
 from docintel.db.session import get_db
 from docintel.documents.extraction import (
     MAX_FILE_BYTES,
@@ -17,9 +18,18 @@ from docintel.documents.extraction import (
 )
 from docintel.documents.normalization import InvalidFilenameError, sanitize_filename
 from docintel.documents.service import delete_document, ingest_document, list_documents
+from docintel.providers.embeddings import EmbeddingProvider, OpenAIEmbeddingProvider
 
 router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
 DatabaseSession = Annotated[Session, Depends(get_db)]
+
+
+def get_embedding_provider() -> EmbeddingProvider:
+    settings = get_settings()
+    return OpenAIEmbeddingProvider(api_key=settings.openai_api_key)
+
+
+EmbeddingProviderDependency = Annotated[EmbeddingProvider, Depends(get_embedding_provider)]
 
 
 @router.post(
@@ -31,11 +41,14 @@ DatabaseSession = Annotated[Session, Depends(get_db)]
         413: {"model": ErrorResponse},
         415: {"model": ErrorResponse},
         422: {"model": ErrorResponse},
+        502: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
         500: {"model": ErrorResponse},
     },
 )
 async def upload_document(
     session: DatabaseSession,
+    embedding_provider: EmbeddingProviderDependency,
     file: Annotated[UploadFile | None, File()] = None,
 ) -> DocumentResponse:
     if file is None:
@@ -64,6 +77,7 @@ async def upload_document(
         filename=filename,
         media_type=PDF_MEDIA_TYPE,
         file_bytes=file_bytes,
+        embedding_provider=embedding_provider,
     )
     return DocumentResponse.from_model(document)
 

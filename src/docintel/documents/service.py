@@ -1,12 +1,20 @@
 import hashlib
 import uuid
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from docintel.db.models import Document, DocumentPage
+from docintel.db.models import Document, DocumentChunk, DocumentPage
 from docintel.documents.extraction import DocumentIngestionError, extract_pdf
+from docintel.indexing.service import prepare_index
+from docintel.providers.embeddings import (
+    EMBEDDING_DIMENSIONS,
+    EMBEDDING_MODEL,
+    EmbeddingProvider,
+    embedding_to_pgvector,
+)
 
 
 class DocumentAlreadyExistsError(DocumentIngestionError):
@@ -44,6 +52,7 @@ def ingest_document(
     filename: str,
     media_type: str,
     file_bytes: bytes,
+    embedding_provider: EmbeddingProvider,
 ) -> Document:
     # Hashing original bytes provides exact deduplication without retaining the binary PDF.
     content_hash = sha256_digest(file_bytes)
@@ -52,11 +61,14 @@ def ingest_document(
     except SQLAlchemyError as error:
         session.rollback()
         raise PersistenceError from error
-    if existing is not None:
-        session.rollback()
-        raise DocumentAlreadyExistsError(existing.id)
+    existing_id = existing.id if existing is not None else None
+    # End the pre-check transaction before CPU work and the external provider call.
+    session.rollback()
+    if existing_id is not None:
+        raise DocumentAlreadyExistsError(existing_id)
 
     extracted = extract_pdf(file_bytes)
+    indexed_chunks = prepare_index(extracted.pages, embedding_provider)
     document = Document(
         id=uuid.uuid4(),
         filename=filename,
@@ -65,9 +77,9 @@ def ingest_document(
         content_hash=content_hash,
         page_count=extracted.page_count,
         extracted_char_count=extracted.extracted_char_count,
-        embedding_model=None,
-        embedding_dimensions=None,
-        indexed_at=None,
+        embedding_model=EMBEDDING_MODEL,
+        embedding_dimensions=EMBEDDING_DIMENSIONS,
+        indexed_at=datetime.now(UTC),
     )
     document.pages = [
         DocumentPage(
@@ -78,9 +90,21 @@ def ingest_document(
         )
         for page in extracted.pages
     ]
+    pages_by_number = {page.page_number: page for page in document.pages}
+    for indexed_chunk in indexed_chunks:
+        chunk = DocumentChunk(
+            id=uuid.uuid4(),
+            document_id=document.id,
+            page_number=indexed_chunk.chunk.page_number,
+            chunk_index=indexed_chunk.chunk.chunk_index,
+            content=indexed_chunk.chunk.content,
+            token_count=indexed_chunk.chunk.token_count,
+            embedding=embedding_to_pgvector(indexed_chunk.embedding),
+        )
+        pages_by_number[indexed_chunk.chunk.page_number].chunks.append(chunk)
 
     try:
-        # Document and every page commit atomically; future indexing remains a separate phase.
+        # Pages and validated chunks commit atomically after every provider call has finished.
         session.add(document)
         session.commit()
     except IntegrityError as error:

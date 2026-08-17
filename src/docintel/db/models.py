@@ -6,6 +6,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     MetaData,
     String,
@@ -15,6 +16,9 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.types import UserDefinedType
+
+from docintel.providers.embeddings import EMBEDDING_DIMENSIONS
 
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
@@ -27,6 +31,20 @@ NAMING_CONVENTION = {
 
 class Base(DeclarativeBase):
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+
+class Vector1536(UserDefinedType[str]):
+    """Minimal pgvector SQL type without an additional Python dependency."""
+
+    cache_ok = True
+
+    def __init__(self, dimensions: int = EMBEDDING_DIMENSIONS) -> None:
+        if dimensions != EMBEDDING_DIMENSIONS:
+            raise ValueError("Only vector(1536) is supported by the v1 schema.")
+        self.dimensions = dimensions
+
+    def get_col_spec(self, **_kwargs: object) -> str:
+        return f"vector({self.dimensions})"
 
 
 class Document(Base):
@@ -58,6 +76,11 @@ class Document(Base):
         passive_deletes=True,
         order_by="DocumentPage.page_number",
     )
+    chunks: Mapped[list[DocumentChunk]] = relationship(
+        primaryjoin="Document.id == DocumentChunk.document_id",
+        viewonly=True,
+        order_by="DocumentChunk.chunk_index",
+    )
 
 
 class DocumentPage(Base):
@@ -77,3 +100,47 @@ class DocumentPage(Base):
     char_count: Mapped[int] = mapped_column(Integer, nullable=False)
 
     document: Mapped[Document] = relationship(back_populates="pages")
+    chunks: Mapped[list[DocumentChunk]] = relationship(
+        back_populates="page",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="DocumentChunk.chunk_index",
+    )
+
+
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+    __table_args__ = (
+        UniqueConstraint("document_id", "chunk_index", name="uq_document_chunks_document_index"),
+        ForeignKeyConstraint(
+            ["document_id"],
+            ["documents.id"],
+            name="fk_document_chunks_document_id_documents",
+            ondelete="CASCADE",
+        ),
+        ForeignKeyConstraint(
+            ["document_id", "page_number"],
+            ["document_pages.document_id", "document_pages.page_number"],
+            name="fk_document_chunks_document_page",
+            ondelete="CASCADE",
+        ),
+        CheckConstraint("page_number >= 1", name="page_number_positive"),
+        CheckConstraint("chunk_index >= 0", name="chunk_index_nonnegative"),
+        CheckConstraint("token_count > 0", name="token_count_positive"),
+        CheckConstraint("token_count <= 600", name="token_count_maximum"),
+        CheckConstraint("length(content) > 0", name="content_nonempty"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    document_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    page_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    token_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    embedding: Mapped[str] = mapped_column(Vector1536(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    document: Mapped[Document] = relationship(viewonly=True)
+    page: Mapped[DocumentPage] = relationship(back_populates="chunks")
