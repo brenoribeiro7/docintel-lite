@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "docintel-lite"
-version = "0.1.0"
-description = "Textual PDF ingestion foundation backed by PostgreSQL"
+version = "1.0.0"
+description = "Evidence-grounded question answering for textual PDF documents"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
