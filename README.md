@@ -1,37 +1,37 @@
 # DocIntel Lite
 
-DocIntel Lite is a small document-intelligence backend. It ingests textual PDFs into an exact
-PostgreSQL/pgvector index and answers questions from selected documents with retrieved-source
-grounding, validated citations, and explicit abstention when evidence is insufficient.
+## Problem
 
-## Current status
+Document answers are useful only when their evidence can be inspected. A fluent answer without
+traceable source text can hide retrieval mistakes, unsupported claims, or insufficient context.
+DocIntel Lite keeps page provenance through ingestion and returns the exact retrieved chunks used
+for generation so callers can verify the evidence behind an answer.
 
-M1 document ingestion, M2 vector indexing/retrieval, and M3 grounded question answering/evaluation
-are implemented. M4 hardening and release work has not started.
+## What the project does
 
-The application is a synchronous modular monolith:
+DocIntel Lite v1.0 is a synchronous API for evidence-grounded question answering over selected
+textual PDF documents:
 
 ```text
-multipart PDF
-  -> bounded in-memory read and validation
-  -> pypdf page extraction
-  -> deterministic text normalization
-  -> page-bounded token chunking
-  -> OpenAI embedding provider boundary
-  -> atomic Document + DocumentPage + DocumentChunk persistence
-
-question + selected document IDs
-  -> one query embedding
-  -> exact PostgreSQL cosine search
-  -> top four typed chunk results with page provenance
-  -> application-assigned S1..Sn source IDs
-  -> OpenAI Responses API structured generation
-  -> citation and abstention validation
-  -> answer + every retrieved source
+PDF
+  -> extraction
+  -> page-aware chunking
+  -> embeddings
+  -> pgvector retrieval
+  -> grounded generation
+  -> validated sources
 ```
 
 The original PDF binary is never stored. Each page is retained as a separate row, including empty
 pages, so stored page numbers continue to match the source document.
+
+## Architecture
+
+The application is a modular FastAPI monolith with synchronous provider and database boundaries.
+PostgreSQL is the system of record; pgvector performs exact cosine retrieval. Ingestion finishes
+all external embedding work before atomically persisting the document, its pages, and its chunks.
+Query generation is stateless, receives no tools, and is validated against application-owned
+source IDs. See [ARCHITECTURE.md](ARCHITECTURE.md) for components, invariants, and trade-offs.
 
 ## Stack
 
@@ -90,6 +90,16 @@ Configuration is limited to:
 
 Embedding dimensions are a schema invariant fixed in code at 1536, not environment configuration.
 
+## v1.0 limits
+
+- Textual PDF only; no OCR.
+- Maximum upload size: 10 MiB.
+- Maximum pages: 100.
+- Maximum normalized text: 500,000 characters.
+- Maximum chunks per document: 250.
+- Chunk size/overlap: 600/100 `cl100k_base` tokens, bounded to a page.
+- Retrieval: exact cosine search with `top_k=4`, without a similarity threshold or ANN index.
+
 ## API
 
 | Method | Path | Behavior |
@@ -108,13 +118,24 @@ The list response never contains page or chunk text. A byte-identical upload is 
 Documents created under M1 remain `INGESTED` and are excluded from retrieval; M2 performs no
 automatic backfill. In development, delete and upload again to index one of those documents.
 
+Upload and synchronously index one PDF:
+
+```bash
+curl --fail-with-body \
+  --form 'file=@./document.pdf;type=application/pdf' \
+  http://127.0.0.1:8000/api/v1/documents
+```
+
 A query accepts only a 1–1000 character question and 1–10 unique indexed document UUIDs:
 
-```json
-{
-  "question": "What is the production request timeout?",
-  "document_ids": ["07a4273c-b3e3-48ca-87cc-b38cb8f25939"]
-}
+```bash
+curl --fail-with-body \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "question": "What is the production request timeout?",
+    "document_ids": ["07a4273c-b3e3-48ca-87cc-b38cb8f25939"]
+  }' \
+  http://127.0.0.1:8000/api/v1/query
 ```
 
 A grounded response returns all and only the chunks sent to generation, in retrieval order. The
@@ -142,10 +163,29 @@ model-declared `citation_ids` is the subset referenced in the answer:
 }
 ```
 
-Insufficient evidence returns HTTP 200 with `abstained=true`, no citations, and the stable answer:
+Insufficient evidence returns HTTP 200 with `abstained=true`, no citations, and the stable answer.
+Retrieved chunks remain visible for inspection even though none is claimed as supporting an answer:
 
-```text
-Insufficient evidence in the selected documents to answer the question.
+```json
+{
+  "question": "What is the annual support budget?",
+  "answer": "Insufficient evidence in the selected documents to answer the question.",
+  "abstained": true,
+  "citation_ids": [],
+  "sources": [
+    {
+      "source_id": "S1",
+      "document_id": "07a4273c-b3e3-48ca-87cc-b38cb8f25939",
+      "filename": "operations.pdf",
+      "page_number": 2,
+      "chunk_id": "03a956a2-80a8-4bc4-92a7-4d4f256f3cc0",
+      "chunk_index": 1,
+      "text": "Support requests are routed through the operations queue.",
+      "similarity": 0.31
+    }
+  ],
+  "retrieval": {"top_k": 4, "chunks_returned": 1}
+}
 ```
 
 ## Chunking and embeddings
@@ -234,7 +274,7 @@ A real upload incurs embedding calls in batches of at most 32. A real query crea
 embedding and at most one generation capped at 700 output tokens. Adapters and application add no
 retry. Real calls can incur cost.
 
-## Tests and quality gates
+## Evaluation and quality gates
 
 The integration and API suites require the real PostgreSQL/pgvector service and an upgraded schema:
 
@@ -261,11 +301,33 @@ and controlled provider doubles. It checks Evidence Recall@4, grounded success, 
 citation validity, the trap, and the adversarial contract. This mode validates plumbing and
 invariants; it does not measure real OpenAI model quality.
 
+The final deterministic v1.0 gate reports:
+
+- dataset: 8 cases;
+- Evidence Recall@4: 1.00 (7/7 gold evidence items retrieved);
+- grounded answerable cases: 6/6;
+- unanswerable abstention: 2/2;
+- citation validity: 100%, with zero invalid source IDs;
+- production/staging retrieval trap: PASS;
+- injection-like case: PASS (`BRAVO-17` retained and `COMPROMISED` absent).
+
 Optional live evaluation uses the same corpus and dataset and can incur cost. It is intentionally
-outside CI and was not run as part of M3:
+manual and outside the public CI; it is not a v1.0 release gate:
 
 ```bash
 uv run python -m evals.run --mode live
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for implemented and planned architectural decisions.
+## Limitations
+
+- Textual PDFs only; scanned/image-only documents require OCR and are rejected.
+- Grounding validation proves source identity and citation consistency, not formal semantic
+  entailment of every generated statement.
+- Hallucination and document prompt-injection risks are mitigated, not eliminated.
+- There is no authentication or tenant isolation.
+- Exact retrieval and synchronous ingestion target a small corpus, not high-throughput workloads.
+
+## Outside v1.0
+
+OCR, additional document formats, authentication, asynchronous workers, object storage, hybrid or
+approximate retrieval, reranking, agents, a frontend, and multimodal processing are not included.

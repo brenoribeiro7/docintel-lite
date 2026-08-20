@@ -3,8 +3,7 @@
 ## Purpose and boundaries
 
 DocIntel Lite is a modular monolith for document-grounded question answering. This document records
-the agreed architecture across milestones while separating implemented behavior from plans. Planned
-components are not claims about current functionality.
+the implemented v1.0 architecture and its deliberate boundaries.
 
 ## Milestone map
 
@@ -23,7 +22,7 @@ components are not claims about current functionality.
 | Citations | Source IDs created and controlled by the application | Implemented in M3 |
 | Orchestration | No agents, tools, or function calling | Implemented constraint |
 | Evaluation | Controlled deterministic harness and optional live path | Implemented in M3 |
-| Hardening/release | Operational hardening and release gates | Pending M4 |
+| Hardening/release | Reproducibility, security review, and final release gates | Complete in M4 |
 
 ## Implemented in M1
 
@@ -113,6 +112,32 @@ Evidence Recall@4 measure whether gold evidence appears. Source validation prove
 were retrieved and sent. It cannot prove semantic entailment for every sentence; prompting and
 end-to-end evaluation mitigate but do not eliminate hallucination or prompt injection.
 
+## Completed in M4
+
+The v1.0 hardening gate freezes the public API, schema, models, chunking, retrieval, grounding, and
+evaluation contracts described above. Installation is verified from the frozen `uv.lock`; Alembic
+is verified both against the current database and from an empty PostgreSQL database through
+`0001_document_ingestion` and `0002_document_chunks`. M4 adds no migration, table, provider,
+endpoint, or retrieval algorithm.
+
+The release checks cover the real PostgreSQL/pgvector integration, deterministic evaluation,
+OpenAPI surface, sanitized error paths, ignored local secrets, and secret-free CI. Live OpenAI
+evaluation remains an explicit manual operation and is not required for a reproducible release.
+
+## Trade-offs
+
+- **Exact search instead of ANN:** exact cosine ordering is deterministic and appropriate for the
+  bounded v1 corpus. It avoids index tuning and recall trade-offs at the cost of poorer scaling.
+- **Synchronous ingestion instead of workers:** the request has simple all-or-nothing semantics and
+  no processing state. It also holds the client connection during provider calls and is unsuitable
+  for high-throughput ingestion.
+- **Direct RAG instead of a framework:** small provider, retrieval, and grounding boundaries keep
+  data flow and failure behavior inspectable. More elaborate orchestration would require explicit
+  justification in a later version.
+- **Application-owned sources instead of model-owned citations:** the model can select only S1..Sn;
+  document and page metadata always comes from retrieved database rows. This validates provenance
+  identity, but it is not a proof of semantic entailment.
+
 ## Security posture
 
 M1 deliberately narrows the input surface to bounded, non-encrypted textual PDFs. It does not
@@ -122,4 +147,4 @@ tool, validates provider output, and keeps source metadata application-controlle
 is not sent to OpenAI; real indexing sends chunk text, while real query sends the question to
 embeddings and question plus up to four chunks to Responses. `store=false` is set, but provider data
 policies still apply. Authentication, multi-user isolation, OCR, object storage, and cloud
-deployment remain outside the current system boundary pending later work.
+deployment remain outside the v1.0 system boundary.
