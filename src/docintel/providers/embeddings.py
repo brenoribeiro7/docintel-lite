@@ -15,6 +15,9 @@ class EmbeddingProvider(Protocol):
     model: str
     dimensions: int
 
+    @property
+    def is_configured(self) -> bool: ...
+
     def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
 
 
@@ -95,6 +98,12 @@ class OpenAIEmbeddingProvider:
     ) -> None:
         self._api_key = api_key
         self._client = client
+
+    @property
+    def is_configured(self) -> bool:
+        if self._client is not None:
+            return True
+        return bool(self._api_key and self._api_key.get_secret_value())
 
     def _get_client(self) -> _EmbeddingClient:
         if self._client is not None:

@@ -12,6 +12,7 @@ from docintel.providers.embeddings import (
     EMBEDDING_MODEL,
     EmbeddingProvider,
     EmbeddingProviderFailure,
+    EmbeddingProviderUnconfigured,
     embedding_to_pgvector,
     validate_embedding_vectors,
 )
@@ -45,6 +46,10 @@ class DocumentsNotSearchableError(RetrievalError):
 
 class RetrievalProviderError(RetrievalError):
     """A sanitized question-embedding failure."""
+
+
+class RetrievalProviderUnconfigured(RetrievalProviderError):
+    """The question-embedding provider has no credentials."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +119,17 @@ def _validate_documents(session: Session, document_ids: list[uuid.UUID]) -> None
         )
 
 
+def validate_retrieval_request(
+    session: Session,
+    *,
+    question: str,
+    document_ids: Sequence[uuid.UUID],
+) -> tuple[str, list[uuid.UUID]]:
+    normalized_question, requested_ids = _validate_request(question, document_ids)
+    _validate_documents(session, requested_ids)
+    return normalized_question, requested_ids
+
+
 def retrieve_chunks(
     session: Session,
     *,
@@ -121,17 +137,23 @@ def retrieve_chunks(
     document_ids: Sequence[uuid.UUID],
     embedding_provider: EmbeddingProvider,
 ) -> list[RetrievalResult]:
-    normalized_question, requested_ids = _validate_request(question, document_ids)
+    normalized_question, requested_ids = validate_retrieval_request(
+        session,
+        question=question,
+        document_ids=document_ids,
+    )
     if (
         embedding_provider.model != EMBEDDING_MODEL
         or embedding_provider.dimensions != EMBEDDING_DIMENSIONS
     ):
         raise RetrievalProviderError("The embedding provider is incompatible with indexed data.")
-    _validate_documents(session, requested_ids)
-
     try:
         query_vectors = embedding_provider.embed([normalized_question])
         query_vector = validate_embedding_vectors(query_vectors, expected_count=1)[0]
+    except EmbeddingProviderUnconfigured as error:
+        raise RetrievalProviderUnconfigured(
+            "The question embedding provider is not configured."
+        ) from error
     except EmbeddingProviderFailure as error:
         raise RetrievalProviderError("The question embedding could not be generated.") from error
 

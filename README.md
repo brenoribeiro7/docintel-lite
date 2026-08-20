@@ -1,14 +1,13 @@
 # DocIntel Lite
 
-DocIntel Lite is a small document-intelligence backend. Its current milestone validates textual
-PDFs, extracts and normalizes page text, builds deterministic chunks, generates embeddings, and
-persists an exact-search index in PostgreSQL/pgvector.
+DocIntel Lite is a small document-intelligence backend. It ingests textual PDFs into an exact
+PostgreSQL/pgvector index and answers questions from selected documents with retrieved-source
+grounding, validated citations, and explicit abstention when evidence is insufficient.
 
 ## Current status
 
-M1 document ingestion and M2 vector indexing/retrieval are implemented. Retrieval is an internal
-service with no public query endpoint. Generation, RAG, grounding, source mapping, abstention, and
-evaluation are not implemented.
+M1 document ingestion, M2 vector indexing/retrieval, and M3 grounded question answering/evaluation
+are implemented. M4 hardening and release work has not started.
 
 The application is a synchronous modular monolith:
 
@@ -25,6 +24,10 @@ question + selected document IDs
   -> one query embedding
   -> exact PostgreSQL cosine search
   -> top four typed chunk results with page provenance
+  -> application-assigned S1..Sn source IDs
+  -> OpenAI Responses API structured generation
+  -> citation and abstention validation
+  -> answer + every retrieved source
 ```
 
 The original PDF binary is never stored. Each page is retained as a separate row, including empty
@@ -51,9 +54,9 @@ uv sync --frozen
 uv run alembic upgrade head
 ```
 
-Set `OPENAI_API_KEY` in `.env` before performing a real upload. Health, readiness, metadata listing,
-migrations, and the deterministic test suite do not require a key. `OPENAI_EMBEDDING_MODEL` accepts
-only `text-embedding-3-small` in v1.
+Set `OPENAI_API_KEY` in `.env` before performing a real upload or query. Health, readiness, metadata
+listing, migrations, and deterministic tests/evaluation do not require a key. The v1 model settings
+accept only `text-embedding-3-small` and `gpt-5.6-terra`.
 
 The Compose file runs only `pgvector/pgvector:0.8.6-pg18-trixie`. Its development credentials are
 local placeholders mirrored in `.env.example`; replace them outside local development and never
@@ -81,8 +84,9 @@ Configuration is limited to:
 
 - `DATABASE_URL`: SQLAlchemy URL using the `postgresql+psycopg` driver.
 - `APP_ENV`: environment label; defaults to `development`.
-- `OPENAI_API_KEY`: required only when a real upload needs embeddings.
+- `OPENAI_API_KEY`: required when real upload/query operations call OpenAI.
 - `OPENAI_EMBEDDING_MODEL`: fixed to `text-embedding-3-small` for v1 compatibility.
+- `OPENAI_GENERATION_MODEL`: fixed to `gpt-5.6-terra` for v1 compatibility.
 
 Embedding dimensions are a schema invariant fixed in code at 1536, not environment configuration.
 
@@ -95,6 +99,7 @@ Embedding dimensions are a schema invariant fixed in code at 1536, not environme
 | `POST` | `/api/v1/documents` | Ingest and synchronously index one textual PDF from multipart field `file` |
 | `GET` | `/api/v1/documents` | List document metadata in deterministic order |
 | `DELETE` | `/api/v1/documents/{document_id}` | Delete a document and cascade to pages and chunks |
+| `POST` | `/api/v1/query` | Retrieve and generate one grounded, stateless answer |
 
 The list response never contains page or chunk text. A byte-identical upload is rejected with
 `409 Conflict` before embedding work when detected by the pre-check. A successful new upload reports
@@ -102,6 +107,46 @@ The list response never contains page or chunk text. A byte-identical upload is 
 
 Documents created under M1 remain `INGESTED` and are excluded from retrieval; M2 performs no
 automatic backfill. In development, delete and upload again to index one of those documents.
+
+A query accepts only a 1–1000 character question and 1–10 unique indexed document UUIDs:
+
+```json
+{
+  "question": "What is the production request timeout?",
+  "document_ids": ["07a4273c-b3e3-48ca-87cc-b38cb8f25939"]
+}
+```
+
+A grounded response returns all and only the chunks sent to generation, in retrieval order. The
+model-declared `citation_ids` is the subset referenced in the answer:
+
+```json
+{
+  "question": "What is the production request timeout?",
+  "answer": "The production request timeout is 30 seconds [S1].",
+  "abstained": false,
+  "citation_ids": ["S1"],
+  "sources": [
+    {
+      "source_id": "S1",
+      "document_id": "07a4273c-b3e3-48ca-87cc-b38cb8f25939",
+      "filename": "operations.pdf",
+      "page_number": 6,
+      "chunk_id": "f25c391c-17a7-4747-b02e-773461293578",
+      "chunk_index": 5,
+      "text": "The production request timeout is 30 seconds.",
+      "similarity": 0.86
+    }
+  ],
+  "retrieval": {"top_k": 4, "chunks_returned": 1}
+}
+```
+
+Insufficient evidence returns HTTP 200 with `abstained=true`, no citations, and the stable answer:
+
+```text
+Insufficient evidence in the selected documents to answer the question.
+```
 
 ## Chunking and embeddings
 
@@ -126,9 +171,32 @@ It embeds the question once with the same model and dimension, then uses pgvecto
 distance operator. Results are ordered by distance, document ID, and chunk index and limited to the
 top four. Similarity is `1 - cosine_distance`.
 
-There is no ANN, HNSW, IVFFlat, hybrid search, reranking, fallback, or public retrieval endpoint.
-Every requested document must exist and already be indexed; partially invalid selections fail
-instead of silently searching a subset.
+There is no ANN, HNSW, IVFFlat, hybrid search, reranking, threshold, or fallback. Every requested
+document must exist and already be indexed; partially invalid selections fail instead of silently
+searching a subset.
+
+## Generation, grounding, and sources
+
+The generation boundary is synchronous and uses the OpenAI Responses API with Structured Outputs.
+It is fixed to `gpt-5.6-terra`, `reasoning.effort=none`, `max_output_tokens=700`, `store=false`, a
+30-second timeout, and zero automatic retries. It sets no temperature and supplies no tools,
+conversation, previous response, background processing, streaming, or external search.
+
+Prompt `v1` keeps static application instructions separate from a JSON user-data input containing
+only the question and retrieved source IDs/text. The application, never the model, assigns S1..Sn
+by retrieval rank and retains document, filename, page, chunk, and similarity metadata. Document
+text and the question remain untrusted data; embedded instructions cannot enable tools or alter
+model/provider configuration.
+
+Structured output contains only `answer`, `abstained`, and `citation_ids`. A non-abstained answer
+must be non-empty, use at least one inline `[Sx]`, and match its unique `citation_ids` exactly. Every
+ID must exist among retrieved chunks. An abstention must have empty model answer/citations and is
+normalized locally. Provider safety refusal is a distinct integration error, not an abstention.
+
+Source validation proves that cited IDs exist, were retrieved, were sent to generation, and were
+referenced consistently. It does not mathematically prove that every generated statement is
+semantically entailed by a cited chunk. Prompt constraints and controlled evaluation reduce risk;
+they do not eliminate hallucination or prompt injection.
 
 ## Ingestion limits and security boundaries
 
@@ -149,7 +217,22 @@ runtime-controlled storage and the original bytes are discarded after processing
 Exact SHA-256 over the received bytes backs database-enforced deduplication. Document metadata and
 all pages and chunks commit in one transaction, so a failed indexing operation leaves no partial
 document. Chunk text remains untrusted data: it cannot alter provider configuration and is never
-executed, interpreted as instructions, or used to fetch a URL.
+executed or used to fetch a URL. Generation receives no tool. The prompt explicitly treats question
+and source content as data and ignores instructions found there. Provider output is schema-checked
+and grounding-checked before it reaches the API response. Prompts, complete chunks, embeddings, raw
+provider responses, API keys, and stack traces are not logged by these paths.
+
+## Privacy and cost boundaries
+
+With real providers, upload sends chunk text to the OpenAI Embeddings API. Query sends the question
+to the Embeddings API, then the question plus at most four retrieved chunk texts to the Responses
+API. The original PDF binary is neither retained nor sent to OpenAI by the application. Generation
+sets `store=false`, but applicable provider data policies still need review before sensitive
+documents are used.
+
+A real upload incurs embedding calls in batches of at most 32. A real query creates one question
+embedding and at most one generation capped at 700 output tokens. Adapters and application add no
+retry. Real calls can incur cost.
 
 ## Tests and quality gates
 
@@ -163,10 +246,26 @@ uv run ruff format --check .
 uv run mypy src tests
 uv run pytest
 uv run alembic check
+uv run python -m evals.run --mode deterministic
 ```
 
 GitHub Actions runs these gates with the same PostgreSQL/pgvector image and requires no external
-secrets. API and retrieval tests inject deterministic 1536-dimensional fake embeddings, so CI never
-calls OpenAI. SQLite is not used as a database substitute.
+secrets. API/RAG tests inject deterministic 1536-dimensional embeddings and structured generation,
+so CI never calls OpenAI. SQLite is not used as a database substitute.
+
+The controlled evaluation dataset has exactly eight cases: three directly answerable, one
+multi-chunk, two unanswerable, one production/staging retrieval trap, and one injection-like
+document. Its synthetic two-PDF corpus is generated from versioned page fixtures. Deterministic mode
+uses real extraction, chunking, PostgreSQL/pgvector retrieval, source mapping, grounding validation,
+and controlled provider doubles. It checks Evidence Recall@4, grounded success, abstention,
+citation validity, the trap, and the adversarial contract. This mode validates plumbing and
+invariants; it does not measure real OpenAI model quality.
+
+Optional live evaluation uses the same corpus and dataset and can incur cost. It is intentionally
+outside CI and was not run as part of M3:
+
+```bash
+uv run python -m evals.run --mode live
+```
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for implemented and planned architectural decisions.

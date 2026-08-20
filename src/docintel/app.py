@@ -4,9 +4,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from docintel.api.routes.documents import router as documents_router
+from docintel.api.routes.query import router as query_router
 from docintel.api.schemas import HealthResponse, ReadinessResponse
 from docintel.db.session import engine
 from docintel.documents.extraction import DocumentIngestionError
+from docintel.rag.service import RAGError
 
 app = FastAPI(
     title="DocIntel Lite",
@@ -16,12 +18,21 @@ app = FastAPI(
     openapi_url=None,
 )
 app.include_router(documents_router)
+app.include_router(query_router)
 
 
 @app.exception_handler(DocumentIngestionError)
 async def handle_ingestion_error(
     _request: Request,
     error: DocumentIngestionError,
+) -> JSONResponse:
+    return JSONResponse(status_code=error.status_code, content=error.response_body())
+
+
+@app.exception_handler(RAGError)
+async def handle_rag_error(
+    _request: Request,
+    error: RAGError,
 ) -> JSONResponse:
     return JSONResponse(status_code=error.status_code, content=error.response_body())
 

@@ -22,6 +22,10 @@ class Settings(BaseSettings):
         default="text-embedding-3-small",
         validation_alias="OPENAI_EMBEDDING_MODEL",
     )
+    openai_generation_model: Literal["gpt-5.6-terra"] = Field(
+        default="gpt-5.6-terra",
+        validation_alias="OPENAI_GENERATION_MODEL",
+    )
 
 
 @lru_cache

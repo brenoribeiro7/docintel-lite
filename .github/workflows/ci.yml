@@ -26,6 +26,7 @@ jobs:
       APP_ENV: test
       DATABASE_URL: postgresql+psycopg://docintel:docintel@localhost:5432/docintel
       OPENAI_EMBEDDING_MODEL: text-embedding-3-small
+      OPENAI_GENERATION_MODEL: gpt-5.6-terra
 
     steps:
       - uses: actions/checkout@v6
@@ -47,3 +48,5 @@ jobs:
         run: uv run alembic upgrade head
       - name: Test
         run: uv run pytest
+      - name: Deterministic evaluation
+        run: uv run python -m evals.run --mode deterministic
